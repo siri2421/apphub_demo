@@ -1,22 +1,46 @@
 import os
+import grpc
+import google.auth
+import google.auth.transport.requests
+import google.auth.transport.grpc
 import redis
 import pg8000.dbapi
-from google.cloud.alloydb.connector import Connector, IPTypes
 from flask import Flask, request, jsonify
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 
 # ── OTel setup ──────────────────────────────────────────────────────────────
-# W3C TraceContext propagation is the default; the incoming traceparent header
-# from the web service is automatically extracted so spans are linked in Cloud Trace.
-provider = TracerProvider()
+_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+resource = Resource.create({
+    "service.name": "user-location",
+    "gcp.project_id": _project_id,
+})
+
+# Authenticate OTLP gRPC channel with Google Cloud ADC
+_gcp_creds, _ = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+_grpc_creds = grpc.composite_channel_credentials(
+    grpc.ssl_channel_credentials(),
+    grpc.metadata_call_credentials(
+        google.auth.transport.grpc.AuthMetadataPlugin(
+            _gcp_creds, google.auth.transport.requests.Request()
+        )
+    ),
+)
+
+provider = TracerProvider(resource=resource)
 provider.add_span_processor(
-    BatchSpanProcessor(CloudTraceSpanExporter())
+    BatchSpanProcessor(OTLPSpanExporter(
+        endpoint="telemetry.googleapis.com:443",
+        credentials=_grpc_creds,
+    ))
 )
 trace.set_tracer_provider(provider)
 
@@ -34,23 +58,21 @@ redis_client = redis.Redis(
     decode_responses=True,
 )
 
-# ── AlloyDB connector (reused across requests) ───────────────────────────────
-_connector = Connector()
-
-ALLOYDB_INSTANCE = os.environ["ALLOYDB_INSTANCE"]
+# ── AlloyDB direct connection (private IP + SSL) ──────────────────────────────
+ALLOYDB_HOST = os.environ["ALLOYDB_HOST"]
 DB_USER = os.environ.get("DB_USER", "postgres")
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 DB_NAME = os.environ.get("DB_NAME", "postgres")
 
 
 def _get_db_conn():
-    return _connector.connect(
-        ALLOYDB_INSTANCE,
-        "pg8000",
+    return pg8000.dbapi.connect(
+        host=ALLOYDB_HOST,
+        port=5432,
         user=DB_USER,
         password=DB_PASSWORD,
-        db=DB_NAME,
-        ip_type=IPTypes.PRIVATE,
+        database=DB_NAME,
+        ssl_context=True,
     )
 
 

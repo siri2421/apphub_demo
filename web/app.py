@@ -1,5 +1,8 @@
 import os
+import grpc
+import google.auth
 import google.auth.transport.requests
+import google.auth.transport.grpc
 import google.oauth2.id_token
 import requests as http_client
 from flask import Flask, request, Response, abort
@@ -7,16 +10,37 @@ from flask import Flask, request, Response, abort
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
 # ── OTel setup ──────────────────────────────────────────────────────────────
-# W3C TraceContext (traceparent) is the default propagator; Cloud Trace
-# understands it, so spans from this service and user-location are linked.
-provider = TracerProvider()
+_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+resource = Resource.create({
+    "service.name": "web",
+    "gcp.project_id": _project_id,
+})
+
+# Authenticate OTLP gRPC channel with Google Cloud ADC (service account in GKE/Cloud Run)
+_gcp_creds, _ = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+_grpc_creds = grpc.composite_channel_credentials(
+    grpc.ssl_channel_credentials(),
+    grpc.metadata_call_credentials(
+        google.auth.transport.grpc.AuthMetadataPlugin(
+            _gcp_creds, google.auth.transport.requests.Request()
+        )
+    ),
+)
+
+provider = TracerProvider(resource=resource)
 provider.add_span_processor(
-    BatchSpanProcessor(CloudTraceSpanExporter())
+    BatchSpanProcessor(OTLPSpanExporter(
+        endpoint="telemetry.googleapis.com:443",
+        credentials=_grpc_creds,
+    ))
 )
 trace.set_tracer_provider(provider)
 
@@ -46,7 +70,12 @@ def user():
     downstream = f"{USER_SERVICE_URL}/user"
     headers = {"Authorization": f"Bearer {_id_token()}"}
 
-    resp = http_client.get(downstream, params={"user_id": user_id}, headers=headers)
+    # peer.service links this outgoing span to the user-location node in AppHub topology
+    with trace.get_tracer(__name__).start_as_current_span(
+        "user-location.get_user",
+        attributes={"peer.service": "user-location"},
+    ):
+        resp = http_client.get(downstream, params={"user_id": user_id}, headers=headers)
     return Response(
         resp.content,
         status=resp.status_code,

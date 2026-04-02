@@ -22,6 +22,13 @@ resource "google_project_iam_member" "gke_trace" {
   member  = "serviceAccount:${google_service_account.gke_sa.email}"
 }
 
+# Allow GKE nodes to pull images from Artifact Registry
+resource "google_project_iam_member" "gke_ar_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.gke_sa.email}"
+}
+
 # Allow GKE pods (via Workload Identity) to invoke Cloud Run
 resource "google_project_iam_member" "gke_run_invoker" {
   project = var.project_id

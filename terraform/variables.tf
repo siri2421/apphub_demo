@@ -1,7 +1,7 @@
 variable "project_id" {
   description = "GCP Project ID"
   type        = string
-  default     = "siri-apphub"
+  default     = "agentic-marketing-demo"
 }
 
 variable "region" {

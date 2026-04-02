@@ -18,14 +18,14 @@ spec:
       serviceAccountName: web-sa
       containers:
         - name: web
-          image: REGION-docker.pkg.dev/PROJECT_ID/apphub/web:latest
+          image: us-central1-docker.pkg.dev/siri-apphub/apphub/web:latest
           ports:
             - containerPort: 8080
           env:
             - name: USER_SERVICE_URL
-              value: "CLOUD_RUN_URL"        # replaced in step 5
+              value: "https://user-location-7hu7r2xwea-uc.a.run.app"        # replaced in step 5
             - name: GOOGLE_CLOUD_PROJECT
-              value: "PROJECT_ID"           # replaced in step 5
+              value: "siri-apphub"           # replaced in step 5
           readinessProbe:
             httpGet:
               path: /healthz

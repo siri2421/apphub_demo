@@ -8,7 +8,7 @@ resource "google_cloud_run_v2_service" "user_location" {
 
     vpc_access {
       connector = google_vpc_access_connector.connector.id
-      egress    = "ALL_TRAFFIC"
+      egress    = "PRIVATE_RANGES_ONLY"
     }
 
     containers {
@@ -23,8 +23,8 @@ resource "google_cloud_run_v2_service" "user_location" {
         value = tostring(google_redis_instance.apphub_redis.port)
       }
       env {
-        name  = "ALLOYDB_INSTANCE"
-        value = google_alloydb_instance.apphub_primary.name
+        name  = "ALLOYDB_HOST"
+        value = google_alloydb_instance.apphub_primary.ip_address
       }
       env {
         name  = "DB_USER"

@@ -8,6 +8,13 @@ resource "google_container_cluster" "apphub_cluster" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
+  node_config {
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+  }
+
   network    = google_compute_network.apphub_vpc.name
   subnetwork = google_compute_subnetwork.apphub_subnet.name
 
@@ -38,6 +45,11 @@ resource "google_container_node_pool" "primary_nodes" {
 
     workload_metadata_config {
       mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
     }
   }
 }
