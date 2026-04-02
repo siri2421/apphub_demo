@@ -7,3 +7,6 @@ __pycache__/
 .env
 .claude/
 key.json
+terraform.tfstate*
+*.bak
+*.tfvars
