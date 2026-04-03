@@ -9,18 +9,24 @@ from flask import Flask, request, jsonify
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
 # ── OTel setup ──────────────────────────────────────────────────────────────
+# The GCP resource detector populates cloud.platform, cloud.region, faas.name
+# etc. for Cloud Run — required by the AppHub topology viewer to identify this
+# component. Explicit attributes (service.name, gcp.project_id) take priority.
 _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-resource = Resource.create({
-    "service.name": "user-location",
-    "gcp.project_id": _project_id,
-})
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+    Resource.create({
+        "service.name": "user-location",
+        "gcp.project_id": _project_id,
+    })
+)
 
 # Authenticate OTLP gRPC channel with Google Cloud ADC
 _gcp_creds, _ = google.auth.default(
@@ -36,8 +42,11 @@ _grpc_creds = grpc.composite_channel_credentials(
 )
 
 provider = TracerProvider(resource=resource)
+# SimpleSpanProcessor exports each span immediately (synchronous).
+# BatchSpanProcessor buffers spans and loses them when Cloud Run scales to zero
+# before flushing — SimpleSpanProcessor avoids that data loss.
 provider.add_span_processor(
-    BatchSpanProcessor(OTLPSpanExporter(
+    SimpleSpanProcessor(OTLPSpanExporter(
         endpoint="telemetry.googleapis.com:443",
         credentials=_grpc_creds,
     ))
@@ -83,14 +92,28 @@ def get_user():
         return jsonify({"error": "user_id query parameter is required"}), 400
 
     # ── 1. Check Redis cache ─────────────────────────────────────────────────
-    with tracer.start_as_current_span("redis.get"):
+    # peer.service + db.system let the AppHub topology viewer draw an edge to
+    # the Redis node and identify it as a cache dependency.
+    with tracer.start_as_current_span("redis.get", attributes={
+        "peer.service": "apphub-redis",
+        "db.system": "redis",
+        "net.peer.name": os.environ.get("REDIS_HOST", ""),
+    }):
         cached = redis_client.get(user_id)
 
     if cached:
         return jsonify({"result": cached, "source": "cache"}), 200
 
     # ── 2. Fall back to AlloyDB ──────────────────────────────────────────────
-    with tracer.start_as_current_span("alloydb.query"):
+    # peer.service + db.* let the topology viewer draw an edge to the AlloyDB
+    # node and identify it as a PostgreSQL-compatible database dependency.
+    with tracer.start_as_current_span("alloydb.query", attributes={
+        "peer.service": "apphub-alloydb",
+        "db.system": "postgresql",
+        "db.name": DB_NAME,
+        "db.user": DB_USER,
+        "net.peer.name": ALLOYDB_HOST,
+    }):
         conn = _get_db_conn()
         cursor = conn.cursor()
         cursor.execute(

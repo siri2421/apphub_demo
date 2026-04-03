@@ -18,14 +18,18 @@ spec:
       serviceAccountName: web-sa
       containers:
         - name: web
-          image: us-central1-docker.pkg.dev/siri-apphub/apphub/web:latest
+          image: us-central1-docker.pkg.dev/agentic-marketing-demo/apphub/web:latest
           ports:
             - containerPort: 8080
           env:
             - name: USER_SERVICE_URL
-              value: "https://user-location-7hu7r2xwea-uc.a.run.app"        # replaced in step 5
+              value: "https://user-location-iupz3py3ha-uc.a.run.app"
             - name: GOOGLE_CLOUD_PROJECT
               value: "siri-apphub"           # replaced in step 5
+            # Route OTLP telemetry to the GKE managed collector (ClusterIP service).
+            # The collector handles GCP auth and exports to Cloud Trace / Cloud Monitoring.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
           readinessProbe:
             httpGet:
               path: /healthz

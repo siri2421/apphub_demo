@@ -1,8 +1,5 @@
 import os
-import grpc
-import google.auth
 import google.auth.transport.requests
-import google.auth.transport.grpc
 import google.oauth2.id_token
 import requests as http_client
 from flask import Flask, request, Response, abort
@@ -11,37 +8,30 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
 # ── OTel setup ──────────────────────────────────────────────────────────────
+# Sends OTLP traces to the managed OTel Collector running in gke-managed-otel
+# (endpoint injected via OTEL_EXPORTER_OTLP_ENDPOINT env var).
+# The GCP resource detector populates cloud.platform, k8s.cluster.name,
+# k8s.namespace.name, k8s.pod.name etc. — required by AppHub topology viewer.
 _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-resource = Resource.create({
-    "service.name": "web",
-    "gcp.project_id": _project_id,
-})
-
-# Authenticate OTLP gRPC channel with Google Cloud ADC (service account in GKE/Cloud Run)
-_gcp_creds, _ = google.auth.default(
-    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-_grpc_creds = grpc.composite_channel_credentials(
-    grpc.ssl_channel_credentials(),
-    grpc.metadata_call_credentials(
-        google.auth.transport.grpc.AuthMetadataPlugin(
-            _gcp_creds, google.auth.transport.requests.Request()
-        )
-    ),
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+    Resource.create({
+        "service.name": "web",
+        "gcp.project_id": _project_id,
+    })
 )
 
 provider = TracerProvider(resource=resource)
-provider.add_span_processor(
-    BatchSpanProcessor(OTLPSpanExporter(
-        endpoint="telemetry.googleapis.com:443",
-        credentials=_grpc_creds,
-    ))
-)
+_otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+if _otlp_endpoint:
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter())
+    )
 trace.set_tracer_provider(provider)
 
 # Instrument Flask (incoming requests) and requests (outgoing call to Cloud Run)

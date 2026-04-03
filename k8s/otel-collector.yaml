@@ -1,0 +1,37 @@
+# GKE Managed Telemetry — Instrumentation CR
+#
+# Configures OTel SDK env vars for pods labelled app=web, pointing them at the
+# managed collector already running in gke-managed-otel. The collector handles
+# GCP auth and exports to Cloud Trace, Cloud Monitoring, and Cloud Logging.
+#
+# Requires managed telemetry to be enabled on the cluster:
+#   gcloud container clusters update <CLUSTER> --enable-managed-prometheus
+#   (or via the GKE console → Observability → Managed Collection)
+apiVersion: telemetry.googleapis.com/v1alpha1
+kind: Instrumentation
+metadata:
+  name: web-instrumentation
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: web
+  otelSDKConfig:
+    tracer_provider:
+      processors:
+        - batch:
+            exporter:
+              otlp_http:
+                endpoint: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces
+    meter_provider:
+      readers:
+        - periodic:
+            exporter:
+              otlp_http:
+                endpoint: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/metrics
+    logger_provider:
+      processors:
+        - batch:
+            exporter:
+              otlp_http:
+                endpoint: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/logs
