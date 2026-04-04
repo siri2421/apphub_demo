@@ -20,4 +20,5 @@ variable "alloydb_password" {
   description = "Password for AlloyDB postgres user"
   type        = string
   sensitive   = true
+  default     = "password"
 }

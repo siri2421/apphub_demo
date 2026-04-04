@@ -28,11 +28,20 @@ resource = detected_resource.merge(
         "service.name": "user-location",
         "service.namespace": "default",
         "gcp.project_id": _project_id,
-        # Required for AppHub to link these spans to the registered Cloud Run
-        # infrastructure — without these, topology viewer treats the data-tier
-        # spans as ungrounded orphans.
         "gcp.resource_type": "cloud_run_revision",
         "cloud.platform": "gcp_cloud_run",
+        # AppHub identity labels — Cloud Run's metadata server does not expose
+        # AppHub context the way GKE does, so we set these explicitly.
+        # They must match the application_id and service_id registered in apphub.tf
+        # so that AppHub can ground these spans to the registered service and
+        # draw topology edges via the peer.service attributes on redis.get /
+        # alloydb.query spans.
+        "gcp.apphub.application.container": f"projects/{_project_id}",
+        "gcp.apphub.application.location": "us-central1",
+        "gcp.apphub.application.id": "apphub-demo",
+        "gcp.apphub.service.id": "user-location",
+        "gcp.apphub.service.criticality_type": "MISSION_CRITICAL",
+        "gcp.apphub.service.environment_type": "PRODUCTION",
     })
 )
 
@@ -122,6 +131,13 @@ def get_user():
         conn.close()
 
     if row:
+        # Write back to Redis so subsequent lookups are served from cache.
+        with tracer.start_as_current_span("redis.set", attributes={
+            "peer.service": "apphub-redis",
+            "db.system": "redis",
+            "net.peer.name": os.environ.get("REDIS_HOST", ""),
+        }):
+            redis_client.set(user_id, row[0])
         return jsonify({"result": row[0], "source": "database"}), 200
 
     return jsonify({"error": "user not found"}), 404
