@@ -37,6 +37,19 @@ resource "google_service_networking_connection" "private_vpc_connection" {
   depends_on              = [google_project_service.apis]
 }
 
+# Proxy-only subnet — required by regional L7 GatewayClasses (gke-l7-rilb,
+# gke-l7-regional-external-managed). Not used by gke-l7-global-external-managed
+# (Google manages global proxy capacity), but retained here for completeness
+# if the GatewayClass is ever changed to a regional variant.
+resource "google_compute_subnetwork" "proxy_subnet" {
+  name          = "apphub-proxy-subnet"
+  ip_cidr_range = "10.3.0.0/24"
+  region        = var.region
+  purpose       = "REGIONAL_MANAGED_PROXY"
+  role          = "ACTIVE"
+  network       = google_compute_network.apphub_vpc.id
+}
+
 # VPC Access Connector — allows Cloud Run to reach VPC resources (Redis, AlloyDB)
 resource "google_vpc_access_connector" "connector" {
   name          = "apphub-connector"

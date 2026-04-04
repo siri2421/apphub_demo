@@ -33,6 +33,26 @@ resource "kubernetes_deployment_v1" "web" {
             name  = "GOOGLE_CLOUD_PROJECT"
             value = var.project_id
           }
+          env {
+            name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+            value = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+          }
+          readiness_probe {
+            http_get {
+              path = "/healthz"
+              port = 8080
+            }
+            initial_delay_seconds = 5
+            period_seconds        = 10
+          }
+          liveness_probe {
+            http_get {
+              path = "/healthz"
+              port = 8080
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 30
+          }
         }
       }
     }
@@ -46,13 +66,23 @@ resource "kubernetes_deployment_v1" "web" {
 }
 
 resource "kubernetes_service_v1" "web_lb" {
-  metadata { name = "web" }
+  metadata {
+    name      = "web"
+    namespace = "default"
+    annotations = {
+      # Named NEG "web-neg" matches the AppHub service_uri registered in apphub.tf
+      "cloud.google.com/neg" = jsonencode({ ingress = true, exposed_ports = { "80" = { name = "web-neg" } } })
+    }
+  }
   spec {
     selector = { app = "web" }
     port {
       port        = 80
       target_port = 8080
     }
-    type = "LoadBalancer"
+    type = "ClusterIP"
   }
 }
+
+# Gateway and HTTPRoute are applied via kubectl (k8s/service.yaml) after
+# Gateway API CRDs are installed by the gateway_api_config cluster update.

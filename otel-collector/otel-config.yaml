@@ -1,0 +1,29 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # resourcedetection auto-populates Cloud Run metadata (project, region, revision,
+  # instance ID) so the googlecloud exporter can route to the right project without
+  # any hard-coded project ID.
+  resourcedetection:
+    detectors: [gcp]
+  batch:
+
+exporters:
+  googlecloud:
+    # Project is resolved automatically via the resourcedetection processor above.
+    # The Cloud Run service account (apphub-cloudrun-sa) provides auth via ADC.
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # resourcedetection must run before batch so resource attributes are attached
+      # to spans before they are grouped and sent to Cloud Trace.
+      processors: [resourcedetection, batch]
+      exporters: [googlecloud]

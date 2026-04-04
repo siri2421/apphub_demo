@@ -48,6 +48,20 @@ resource "google_cloud_run_v2_service" "user_location" {
         value = var.project_id
       }
     }
+
+    # OTel Collector sidecar — receives OTLP from the app on localhost and
+    # exports to Cloud Trace using the service account credentials via ADC.
+    containers {
+      name  = "otel-collector"
+      image = "${var.region}-docker.pkg.dev/${var.project_id}/apphub/otel-collector:latest"
+
+      resources {
+        limits = {
+          cpu    = "0.5"
+          memory = "256Mi"
+        }
+      }
+    }
   }
 
   depends_on = [

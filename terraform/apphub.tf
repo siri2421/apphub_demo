@@ -99,54 +99,48 @@ resource "google_apphub_service" "alloydb" {
   }
 }
 
-# ── Discover & register GKE LoadBalancer Service ─────────────────────────────
-# The K8s web Service (type=LoadBalancer) is the external entry point.
-# Its backing GCP forwarding rule name = "a" + first 31 chars of service UID
-# (hyphens removed) — derived deterministically by GKE.
-locals {
-  web_svc_uid_no_hyphens = replace(kubernetes_service_v1.web_lb.metadata[0].uid, "-", "")
-  forwarding_rule_name   = "a${substr(local.web_svc_uid_no_hyphens, 0, 31)}"
-}
-
-data "google_apphub_discovered_service" "web_k8s_svc" {
+# ── Discover & register the Global External ALB (Gateway) ───────────────────
+# The gke-l7-global-external-managed Gateway creates a global forwarding rule.
+# AppHub discovers it via the GKE Gateway resource URI, enabling the
+# LB → web topology edge to appear in the viewer.
+data "google_apphub_discovered_service" "web_l7_lb" {
   project     = var.project_id
   location    = var.region
-  service_uri = "//container.googleapis.com/projects/${data.google_project.project.number}/zones/${var.zone}/clusters/${google_container_cluster.apphub_cluster.name}/k8s/namespaces/default/services/web"
+  service_uri = "//container.googleapis.com/projects/${data.google_project.project.number}/zones/${var.zone}/clusters/${google_container_cluster.apphub_cluster.name}/k8s/namespaces/default/apis/gateway.networking.k8s.io/gateways/web"
   depends_on  = [google_apphub_application.apphub_demo]
 }
 
-resource "google_apphub_service" "web_k8s_svc" {
+resource "google_apphub_service" "web_l7_lb" {
   project            = var.project_id
   location           = var.region
   application_id     = google_apphub_application.apphub_demo.application_id
-  service_id         = "web-lb-service"
-  display_name       = "web-lb-service"
-  discovered_service = data.google_apphub_discovered_service.web_k8s_svc.name
+  service_id         = "web-l7-lb"
+  display_name       = "web-l7-lb"
+  discovered_service = data.google_apphub_discovered_service.web_l7_lb.name
 
   attributes {
-    environment {
-      type = "PRODUCTION"
-    }
-    criticality {
-      type = "MISSION_CRITICAL"
-    }
+    environment { type = "PRODUCTION" }
+    criticality  { type = "MISSION_CRITICAL" }
   }
 }
 
-data "google_apphub_discovered_service" "web_forwarding_rule" {
+# ── Discover & register GKE web NEG ──────────────────────────────────────────
+# The NEG "web-neg" is created by the cloud.google.com/neg annotation on the
+# web Service and is the backend for the L7 LB.
+data "google_apphub_discovered_service" "web_neg" {
   project     = var.project_id
   location    = var.region
-  service_uri = "//compute.googleapis.com/projects/${data.google_project.project.number}/regions/${var.region}/forwardingRules/${local.forwarding_rule_name}"
+  service_uri = "//compute.googleapis.com/projects/${data.google_project.project.number}/zones/${var.zone}/networkEndpointGroups/web-neg"
   depends_on  = [google_apphub_application.apphub_demo]
 }
 
-resource "google_apphub_service" "web_forwarding_rule" {
+resource "google_apphub_service" "web_neg" {
   project            = var.project_id
   location           = var.region
   application_id     = google_apphub_application.apphub_demo.application_id
-  service_id         = "web-forwarding-rule"
-  display_name       = "web-forwarding-rule"
-  discovered_service = data.google_apphub_discovered_service.web_forwarding_rule.name
+  service_id         = "web-neg"
+  display_name       = "web-neg"
+  discovered_service = data.google_apphub_discovered_service.web_neg.name
 
   attributes {
     environment {

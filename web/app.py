@@ -5,6 +5,10 @@ import requests as http_client
 from flask import Flask, request, Response, abort
 
 from opentelemetry import trace
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
@@ -13,15 +17,24 @@ from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
+# Accept both W3C traceparent (service-to-service) and X-Cloud-Trace-Context
+# (injected by the Global External ALB) so the very first hop is visible in
+# Cloud Trace topology. W3C is checked first; GCP header is the fallback.
+set_global_textmap(CompositePropagator([
+    TraceContextTextMapPropagator(),
+    CloudTraceFormatPropagator(),
+]))
+
 # ── OTel setup ──────────────────────────────────────────────────────────────
-# Sends OTLP traces to the managed OTel Collector running in gke-managed-otel
-# (endpoint injected via OTEL_EXPORTER_OTLP_ENDPOINT env var).
-# The GCP resource detector populates cloud.platform, k8s.cluster.name,
-# k8s.namespace.name, k8s.pod.name etc. — required by AppHub topology viewer.
+# Use the GCP-detected resource as the base so cloud.platform, k8s.cluster.name,
+# k8s.namespace.name, k8s.pod.name etc. are populated for AppHub topology.
+# Merge service-specific attributes on top; they take priority.
 _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+detected_resource = GoogleCloudResourceDetector(raise_on_error=False).detect()
+resource = detected_resource.merge(
     Resource.create({
         "service.name": "web",
+        "service.namespace": "default",
         "gcp.project_id": _project_id,
     })
 )
@@ -34,10 +47,11 @@ if _otlp_endpoint:
     )
 trace.set_tracer_provider(provider)
 
-# Instrument Flask (incoming requests) and requests (outgoing call to Cloud Run)
+# Instrument Flask (incoming requests) and requests (outgoing call to Cloud Run).
 # RequestsInstrumentor automatically injects traceparent into outgoing headers.
-FlaskInstrumentor().instrument_app  # applied below, after app creation
-RequestsInstrumentor().instrument()
+# Exclude the GKE metadata server — token fetch calls are internal noise,
+# not application-level spans worth tracing.
+RequestsInstrumentor().instrument(excluded_urls="metadata.google.internal")
 
 app = Flask(__name__)
 FlaskInstrumentor().instrument_app(app)

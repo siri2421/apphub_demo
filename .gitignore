@@ -10,3 +10,5 @@ key.json
 terraform.tfstate*
 *.bak
 *.tfvars
+*.tfplan
+terraform/tfplan

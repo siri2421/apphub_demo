@@ -25,7 +25,7 @@ spec:
             - name: USER_SERVICE_URL
               value: "https://user-location-iupz3py3ha-uc.a.run.app"
             - name: GOOGLE_CLOUD_PROJECT
-              value: "siri-apphub"           # replaced in step 5
+              value: "agentic-marketing-demo"
             # Route OTLP telemetry to the GKE managed collector (ClusterIP service).
             # The collector handles GCP auth and exports to Cloud Trace / Cloud Monitoring.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

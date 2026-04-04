@@ -1,13 +1,11 @@
 import os
-import grpc
-import google.auth
-import google.auth.transport.requests
-import google.auth.transport.grpc
 import redis
 import pg8000.dbapi
 from flask import Flask, request, jsonify
 
 from opentelemetry import trace
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.resources import Resource
@@ -16,44 +14,44 @@ from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
+# Force W3C Trace Context (traceparent header) for cross-service trace propagation
+set_global_textmap(TraceContextTextMapPropagator())
+
 # ── OTel setup ──────────────────────────────────────────────────────────────
-# The GCP resource detector populates cloud.platform, cloud.region, faas.name
-# etc. for Cloud Run — required by the AppHub topology viewer to identify this
-# component. Explicit attributes (service.name, gcp.project_id) take priority.
+# Use the GCP-detected resource as the base so cloud.platform, cloud.region,
+# faas.name etc. for Cloud Run are populated for AppHub topology.
+# Merge service-specific attributes on top; they take priority.
 _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+detected_resource = GoogleCloudResourceDetector(raise_on_error=False).detect()
+resource = detected_resource.merge(
     Resource.create({
         "service.name": "user-location",
+        "service.namespace": "default",
         "gcp.project_id": _project_id,
+        # Required for AppHub to link these spans to the registered Cloud Run
+        # infrastructure — without these, topology viewer treats the data-tier
+        # spans as ungrounded orphans.
+        "gcp.resource_type": "cloud_run_revision",
+        "cloud.platform": "gcp_cloud_run",
     })
 )
 
-# Authenticate OTLP gRPC channel with Google Cloud ADC
-_gcp_creds, _ = google.auth.default(
-    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-_grpc_creds = grpc.composite_channel_credentials(
-    grpc.ssl_channel_credentials(),
-    grpc.metadata_call_credentials(
-        google.auth.transport.grpc.AuthMetadataPlugin(
-            _gcp_creds, google.auth.transport.requests.Request()
-        )
-    ),
-)
-
 provider = TracerProvider(resource=resource)
-# SimpleSpanProcessor exports each span immediately (synchronous).
-# BatchSpanProcessor buffers spans and loses them when Cloud Run scales to zero
-# before flushing — SimpleSpanProcessor avoids that data loss.
+# SimpleSpanProcessor sends each span to the local OTel Collector sidecar
+# synchronously (no buffering). This ensures spans are delivered before Cloud
+# Run scales the instance to zero; the sidecar then batches and forwards to
+# Cloud Trace using the service account credentials (no manual auth needed here).
 provider.add_span_processor(
     SimpleSpanProcessor(OTLPSpanExporter(
-        endpoint="telemetry.googleapis.com:443",
-        credentials=_grpc_creds,
+        endpoint="localhost:4317",
+        insecure=True,
     ))
 )
 trace.set_tracer_provider(provider)
 
-RedisInstrumentor().instrument()
+# RedisInstrumentor removed — the manual redis.get span already carries
+# peer.service=apphub-redis and db.system=redis for AppHub topology.
+# Auto-instrumentation added a redundant GET span alongside it.
 
 app = Flask(__name__)
 FlaskInstrumentor().instrument_app(app)

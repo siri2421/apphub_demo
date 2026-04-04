@@ -1,6 +1,8 @@
 # AppHub Demo — GKE + Cloud Run + AlloyDB + Memorystore
 
-A traditional application demonstrating end-to-end OTel tracing across GKE and Cloud Run, backed by AlloyDB (Postgres) and Memorystore (Redis), with AppHub topology visibility.
+End-to-end distributed tracing demo across GKE (L7 Gateway API) and Cloud Run, backed by AlloyDB (Postgres) and Memorystore (Redis), with AppHub topology visibility via W3C Trace Context propagation.
+
+---
 
 ## Architecture
 
@@ -8,44 +10,58 @@ A traditional application demonstrating end-to-end OTel tracing across GKE and C
 Internet
    │
    ▼
-[GCP Forwarding Rule / K8s LoadBalancer Service :80]
+[GKE Gateway API — L7 Global External HTTP LB]
+  GatewayClass: gke-l7-global-external-managed
+  HTTPRoute: web → Service web:80
    │
+   │  HTTP/1.1 (routed via NEG to pod IP)
    ▼
 [web Pod — GKE Deployment]
-  Flask + OTel (HTTP exporter)
-  spans → managed OTel Collector (gke-managed-otel)
+  Flask + OTel (HTTP OTLP exporter)
+  W3C traceparent header propagation
+  resource: service.name=web, service.namespace=default
+  spans → managed OTel Collector (gke-managed-otel:4318)
         → Cloud Trace / Cloud Monitoring
    │
-   │  traceparent header (W3C)
+   │  HTTPS + traceparent header (W3C Trace Context)
+   │  Authorization: Bearer <OIDC token via Workload Identity>
    ▼
 [Cloud Run: user-location]
-  Flask + OTel (gRPC exporter → telemetry.googleapis.com)
+  Flask + OTel (gRPC OTLP → telemetry.googleapis.com:443)
+  W3C traceparent header propagation
+  resource: service.name=user-location, service.namespace=default
   peer.service=apphub-redis    peer.service=apphub-alloydb
    │                                  │
    ▼                                  ▼
-[Memorystore Redis]           [AlloyDB for Postgres]
- span: redis.get               span: alloydb.query
+[Memorystore Redis 7.0]       [AlloyDB for PostgreSQL]
+  span: redis.get               span: alloydb.query
+  db.system=redis               db.system=postgresql
 ```
 
 ### Components
 
 | Component | Runtime | Role |
 |---|---|---|
-| `web` | GKE Deployment | Receives HTTP, proxies `/user` to `user-location` |
-| `user-location` | Cloud Run | Checks Redis cache, falls back to AlloyDB |
-| Memorystore Redis 7.0 | Managed | Cache layer |
-| AlloyDB for Postgres | Managed | Source of truth for user records |
-| OTel Collector | GKE managed (`gke-managed-otel`) | Receives OTLP from web pods, exports to Google Cloud |
-| AppHub (`apphub-demo`) | AppHub | Topology and component registry |
+| `web` | GKE Deployment (2 replicas) | Receives HTTP via L7 LB, authenticates and proxies `/user` to `user-location` via Workload Identity OIDC |
+| `user-location` | Cloud Run v2 | Checks Redis cache, falls back to AlloyDB for user lookups |
+| GKE Gateway | GKE Gateway API (`gke-l7-global-external-managed`) | L7 HTTP load balancer, NEG-backed, health check on `/healthz` |
+| Memorystore Redis 7.0 | Managed | Cache layer — keyed by `user_id` |
+| AlloyDB for PostgreSQL | Managed | Source of truth for user records |
+| OTel Collector | GKE managed (`gke-managed-otel`) | Receives OTLP/HTTP from `web` pods, exports to Cloud Trace + Cloud Monitoring |
+| AppHub (`apphub-demo`) | AppHub | Topology and component registry for all services |
 
 ### OTel Trace Export
 
-| Service | Exporter | Endpoint |
-|---|---|---|
-| `web` (GKE) | HTTP OTLP | `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318` |
-| `user-location` (Cloud Run) | gRPC OTLP | `telemetry.googleapis.com:443` (Google-managed) |
+| Service | Exporter | Endpoint | Why |
+|---|---|---|---|
+| `web` (GKE) | OTLP HTTP | `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318` | In-cluster collector handles GCP auth |
+| `user-location` (Cloud Run) | OTLP gRPC | `telemetry.googleapis.com:443` | Cloud Run cannot reach the in-cluster collector; uses ADC credentials directly |
 
-Cloud Run cannot reach the in-cluster collector, so it exports directly to Google's OTLP endpoint using ADC credentials.
+### OTel Configuration in Code (both services)
+
+- **Propagator**: W3C Trace Context (`TraceContextTextMapPropagator`) — ensures `traceparent` header is read on ingress and injected on egress
+- **Resource detection**: `GoogleCloudResourceDetector` provides GCP/GKE attributes (`cloud.platform`, `k8s.cluster.name`, `k8s.namespace.name`, `k8s.pod.name`) as the base resource; `service.name` and `service.namespace` are merged on top
+- **`service.namespace`**: Set to `"default"` (matches the Kubernetes namespace) — AppHub uses this to distinguish services within the same project
 
 ---
 
@@ -55,33 +71,31 @@ Cloud Run cannot reach the in-cluster collector, so it exports directly to Googl
 apphub_demo/
 ├── cloudbuild.yaml             # Cloud Build — builds and pushes both images
 ├── terraform/
-│   ├── main.tf                 # Provider config, API enablement (incl. apphub.googleapis.com)
+│   ├── main.tf                 # Provider config, API enablement
 │   ├── variables.tf            # project_id, region, zone, alloydb_password
 │   ├── network.tf              # VPC, subnet, private services access, VPC connector
-│   ├── gke.tf                  # GKE cluster + node pool (Workload Identity enabled)
+│   ├── gke.tf                  # GKE cluster + node pool (Workload Identity, Gateway API enabled)
 │   ├── alloydb.tf              # AlloyDB cluster + PRIMARY instance
 │   ├── redis.tf                # Memorystore Redis instance
 │   ├── iam.tf                  # Service accounts, IAM bindings, Artifact Registry
 │   ├── secrets.tf              # Secret Manager secret for DB password
 │   ├── cloudrun.tf             # Cloud Run service + IAM invoke binding
-│   ├── kubernetes.tf           # K8s service account, deployment, LB service (via TF)
+│   ├── kubernetes.tf           # K8s service account, deployment, ClusterIP service (via TF)
 │   ├── apphub.tf               # AppHub application + all component registrations
 │   └── outputs.tf              # Useful resource references
 ├── web/                        # GKE web service
-│   ├── app.py                  # Flask + OTel (HTTP exporter, GCP resource detector)
-│   ├── requirements.txt
+│   ├── app.py                  # Flask + OTel HTTP exporter, W3C propagator, GCP resource detector
+│   ├── requirements.txt        # opentelemetry-exporter-otlp-proto-http
 │   └── Dockerfile
 ├── user-location/              # Cloud Run user-location service
-│   ├── app.py                  # Flask + OTel (gRPC exporter, GCP resource detector)
-│   ├── requirements.txt
+│   ├── app.py                  # Flask + OTel gRPC exporter, W3C propagator, GCP resource detector
+│   ├── requirements.txt        # opentelemetry-exporter-otlp-proto-grpc
 │   └── Dockerfile
-├── k8s/                        # Kubernetes manifests
-│   ├── serviceaccount.yaml     # web-sa with Workload Identity annotation
-│   ├── deployment.yaml         # web deployment (OTEL_EXPORTER_OTLP_ENDPOINT set)
-│   ├── service.yaml            # LoadBalancer service
-│   └── otel-collector.yaml     # Instrumentation CR (telemetry.googleapis.com/v1alpha1)
-└── scripts/
-    └── seed_db.sql             # Creates users table and inserts sample rows
+└── k8s/                        # Kubernetes manifests
+    ├── serviceaccount.yaml     # web-sa with Workload Identity annotation
+    ├── deployment.yaml         # web Deployment (OTEL_EXPORTER_OTLP_ENDPOINT=:4318)
+    ├── service.yaml            # ClusterIP Service + Gateway + HTTPRoute + HealthCheckPolicy
+    └── otel-collector.yaml     # Instrumentation CR (telemetry.googleapis.com/v1alpha1)
 ```
 
 ---
@@ -89,12 +103,12 @@ apphub_demo/
 ## Prerequisites
 
 ```bash
-gcloud --version      # Google Cloud SDK >= 450
+gcloud --version      # >= 450
 terraform --version   # >= 1.5
 kubectl version       # any recent
 ```
 
-> **No Docker required.** Images are built and pushed to Artifact Registry using **Cloud Build**.
+> **No Docker required locally.** Images are built and pushed using **Cloud Build**.
 
 ---
 
@@ -119,39 +133,43 @@ cd apphub_demo/terraform
 
 terraform init
 
-# Preview
-terraform plan -var="project_id=${PROJECT_ID}" -var="alloydb_password=YOUR_STRONG_PASSWORD"
+# Preview all changes
+terraform plan \
+  -var="project_id=${PROJECT_ID}" \
+  -var="alloydb_password=YOUR_STRONG_PASSWORD"
 
-# Apply (takes ~15–20 min; AlloyDB and GKE are the slow resources)
-terraform apply -var="project_id=${PROJECT_ID}" -var="alloydb_password=YOUR_STRONG_PASSWORD"
+# Apply (takes ~15–20 min; AlloyDB, GKE, and Gateway API enablement are the slow resources)
+terraform apply \
+  -var="project_id=${PROJECT_ID}" \
+  -var="alloydb_password=YOUR_STRONG_PASSWORD"
 
-# Capture outputs for later steps
+# Capture outputs
 export CLOUD_RUN_URL=$(terraform output -raw cloudrun_url)
 export GKE_CLUSTER=$(terraform output -raw gke_cluster_name)
 export GKE_ZONE=$(terraform output -raw gke_cluster_zone)
-export AR_REPO="${REGION}-docker.pkg.dev/${PROJECT_ID}/apphub"
+export AR_REPO=$(terraform output -raw artifact_registry)
 ```
 
-**What Terraform creates:**
+**What Terraform provisions:**
 
-| Resource | Description |
+| Resource | Details |
 |---|---|
-| `apphub-vpc` | Custom VPC with GKE secondary ranges |
+| `apphub-vpc` | Custom VPC with GKE pod/service secondary ranges |
 | `apphub-connector` | Serverless VPC Access connector for Cloud Run → Redis/AlloyDB |
-| `apphub-cluster` | GKE cluster (zone `us-central1-a`, 2× e2-standard-2, Workload Identity enabled) |
+| `apphub-cluster` | GKE cluster — zone `us-central1-a`, 2× e2-standard-2, Workload Identity + **Gateway API (`CHANNEL_STANDARD`)** enabled |
 | `apphub-alloydb` | AlloyDB cluster + PRIMARY instance |
 | `apphub-redis` | Memorystore Redis 7.0, BASIC tier, 1 GB |
-| `apphub` | Artifact Registry Docker repo |
-| `user-location` | Cloud Run v2 service |
-| IAM | Two SAs (`apphub-gke-sa`, `apphub-cloudrun-sa`) with least-privilege roles |
-| Secret Manager | `apphub-db-password` secret |
-| AppHub `apphub-demo` | Application with web, user-location, Redis, AlloyDB, and LB components registered |
+| `apphub` (AR) | Artifact Registry Docker repository |
+| `user-location` | Cloud Run v2 service (VPC egress for private networking) |
+| IAM | `apphub-gke-sa`, `apphub-cloudrun-sa` with least-privilege roles |
+| Secret Manager | `apphub-db-password` |
+| AppHub `apphub-demo` | Application with web workload, user-location, Redis, and AlloyDB services registered |
 
 ---
 
 ## Step 3 — Enable GKE Managed Telemetry
 
-Enable the managed OpenTelemetry Operator on the cluster. This deploys the collector in the `gke-managed-otel` namespace automatically.
+Deploys the OTel Collector in the `gke-managed-otel` namespace automatically.
 
 ```bash
 gcloud container clusters update apphub-cluster \
@@ -161,8 +179,8 @@ gcloud container clusters update apphub-cluster \
 
 # Verify the collector is running
 kubectl get pods -n gke-managed-otel
-# NAME                                       READY   STATUS    RESTARTS   AGE
-# opentelemetry-collector-xxxxx-xxxxx        1/1     Running   0          ...
+# NAME                                    READY   STATUS    RESTARTS   AGE
+# opentelemetry-collector-xxxxx-xxxxx     1/1     Running   0          ...
 ```
 
 ---
@@ -178,13 +196,13 @@ gcloud builds submit \
   .
 ```
 
-Cloud Build builds both images in parallel and pushes them to:
+Cloud Build builds and pushes:
 - `us-central1-docker.pkg.dev/${PROJECT_ID}/apphub/web:latest`
 - `us-central1-docker.pkg.dev/${PROJECT_ID}/apphub/user-location:latest`
 
 ---
 
-## Step 5 — Deploy Cloud Run with the built image
+## Step 5 — Deploy Cloud Run
 
 ```bash
 gcloud run services update user-location \
@@ -207,32 +225,37 @@ curl -H "Authorization: Bearer $TOKEN" "${CLOUD_RUN_URL}/healthz"
 gcloud container clusters get-credentials ${GKE_CLUSTER} \
   --zone ${GKE_ZONE} --project ${PROJECT_ID}
 
-# Apply Kubernetes manifests
+# Apply all manifests (Service, Gateway, HTTPRoute, HealthCheckPolicy, OTel CR)
 kubectl apply -f k8s/serviceaccount.yaml
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
-
-# Apply the managed OTel Instrumentation CR
-# (configures SDK env vars for pods with app=web, pointing to the managed collector)
 kubectl apply -f k8s/otel-collector.yaml
 
-# Wait for rollout
+# Wait for deployment rollout
 kubectl rollout status deployment/web
 
-# Get the external IP (takes 1–2 min for the LB to provision)
-export LB_IP=$(kubectl get service web -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-echo "LoadBalancer IP: ${LB_IP}"
+# Get the L7 Gateway external IP (takes 2–5 min for GCP to fully program the LB)
+export GW_IP=$(kubectl get gateway web -n default -o jsonpath='{.status.addresses[0].value}')
+echo "Gateway IP: ${GW_IP}"
 ```
+
+> The `k8s/service.yaml` creates four resources:
+> 1. **ClusterIP Service** — with NEG annotation (`cloud.google.com/neg`) so GKE registers pod IPs as network endpoints
+> 2. **Gateway** — provisions the global L7 external HTTP LB (`gke-l7-global-external-managed`)
+> 3. **HTTPRoute** — routes all traffic to the `web` service on port 80
+> 4. **HealthCheckPolicy** — configures the GCP health check to use `/healthz` on port 8080
 
 ---
 
 ## Step 7 — Seed AlloyDB
 
-AlloyDB has no public IP; connect from inside the VPC using a one-shot pod in GKE:
+AlloyDB has no public IP. Connect via a one-shot pod inside the GKE cluster:
 
 ```bash
 ALLOYDB_IP=$(gcloud alloydb instances describe apphub-primary \
-  --cluster=apphub-alloydb --region=${REGION} --project=${PROJECT_ID} \
+  --cluster=apphub-alloydb \
+  --region=${REGION} \
+  --project=${PROJECT_ID} \
   --format="value(ipAddresses[0].ipAddress)")
 
 kubectl run psql-seed --rm -it \
@@ -246,68 +269,76 @@ kubectl run psql-seed --rm -it \
 The seed script creates:
 
 ```sql
-CREATE TABLE users (user_id VARCHAR(64) PRIMARY KEY, user_name VARCHAR(255) NOT NULL);
--- Inserts: u1 → Alice Smith, u2 → Bob Jones, u3 → Carol Williams
+CREATE TABLE users (
+  user_id   VARCHAR(64)  PRIMARY KEY,
+  user_name VARCHAR(255) NOT NULL
+);
+-- Sample rows: u1 → Alice Smith, u2 → Bob Jones, u3 → Carol Williams
 ```
 
 ---
 
-## Step 8 — Test end-to-end
+## Step 8 — End-to-end flow test
 
 ```bash
-LB_IP=$(kubectl get service web -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+export GW_IP=$(kubectl get gateway web -n default -o jsonpath='{.status.addresses[0].value}')
 
-# Health check
-curl "http://${LB_IP}/healthz"
+# 1. Health check — verifies L7 LB → web pod
+curl "http://${GW_IP}/healthz"
 # → {"status":"ok"}
 
-# AlloyDB path (first request — cache cold)
-curl "http://${LB_IP}/user?user_id=u1"
+# 2. User lookup — full flow: L7 LB → web → user-location → AlloyDB
+curl "http://${GW_IP}/user?user_id=u1"
 # → {"result":"Alice Smith","source":"database"}
 
-# Repeat (Redis still cold — no write path in demo)
-curl "http://${LB_IP}/user?user_id=u2"
+# 3. Second user — verify routing works across replicas
+curl "http://${GW_IP}/user?user_id=u2"
 # → {"result":"Bob Jones","source":"database"}
 
-# Unknown user
-curl "http://${LB_IP}/user?user_id=u999"
+# 4. Unknown user — validates AlloyDB 404 path
+curl "http://${GW_IP}/user?user_id=u999"
 # → {"error":"user not found"}
 
-# Missing param
-curl "http://${LB_IP}/user"
+# 5. Missing param — validates web-layer input validation
+curl "http://${GW_IP}/user"
 # → {"error":"user_id query parameter is required"}
 
-# Generate load for AppHub topology
-for i in {1..10}; do
+# 6. Verify GCP backend health (all should be HEALTHY)
+gcloud compute backend-services get-health \
+  $(gcloud compute backend-services list --global --project=${PROJECT_ID} \
+    --filter="name~gkegw.*default-web" --format="value(name)") \
+  --global --project=${PROJECT_ID} \
+  --format="yaml(status.healthStatus[].healthState)"
+
+# 7. Generate load to populate AppHub topology
+for i in {1..20}; do
   for uid in u1 u2 u3; do
-    curl -s "http://${LB_IP}/user?user_id=${uid}" > /dev/null
+    curl -s "http://${GW_IP}/user?user_id=${uid}" > /dev/null
   done
 done
-echo "Done"
+echo "Done — check Cloud Trace and AppHub topology in ~5 minutes"
 ```
 
 ---
 
 ## Step 9 — Rebuild and redeploy after code changes
 
-Use Cloud Build — no Docker needed locally:
-
 ```bash
 cd apphub_demo
 
-# Rebuild both images and push
+# Rebuild and push both images
 gcloud builds submit \
   --config cloudbuild.yaml \
   --project=${PROJECT_ID} \
   .
 
-# Redeploy Cloud Run
+# Redeploy Cloud Run (picks up new :latest)
 gcloud run services update user-location \
   --image "${AR_REPO}/user-location:latest" \
   --region ${REGION} \
   --project ${PROJECT_ID}
 
-# Redeploy GKE web (rolling restart picks up new :latest image)
+# Rolling restart GKE web pods to pick up new :latest image
 kubectl rollout restart deployment/web
 kubectl rollout status deployment/web
 ```
@@ -317,28 +348,40 @@ kubectl rollout status deployment/web
 ## Observability
 
 ### Cloud Trace
-View distributed traces at [Cloud Trace](https://console.cloud.google.com/traces). Each request spans `web → user-location → alloydb.query` (and `redis.get`), linked by the W3C `traceparent` header.
+
+View distributed traces at [console.cloud.google.com/traces](https://console.cloud.google.com/traces).
+
+Each request produces a trace spanning:
+```
+web (Flask inbound)
+  └─► user-location.get_user (outbound span, peer.service=user-location)
+        └─► flask.get_user (Cloud Run inbound)
+              ├─► redis.get       (db.system=redis)
+              └─► alloydb.query   (db.system=postgresql)
+```
+
+All spans are linked by the W3C `traceparent` header injected by `RequestsInstrumentor` in the `web` service and read by `FlaskInstrumentor` in `user-location`.
 
 ### AppHub Topology Viewer
-The `apphub-demo` application in [AppHub](https://console.cloud.google.com/apphub) shows the topology built from traces:
+
+The `apphub-demo` application in [console.cloud.google.com/apphub](https://console.cloud.google.com/apphub) renders the dependency graph:
 
 ```
 web (GKE Workload)
-  └─► user-location (Cloud Run Service)    [via peer.service]
-        ├─► apphub-redis (Memorystore)     [via peer.service + db.system=redis]
-        └─► apphub-alloydb (AlloyDB)       [via peer.service + db.system=postgresql]
+  └─► user-location (Cloud Run Service)   [peer.service=user-location]
+        ├─► apphub-redis (Memorystore)    [peer.service=apphub-redis, db.system=redis]
+        └─► apphub-alloydb (AlloyDB)      [peer.service=apphub-alloydb, db.system=postgresql]
 ```
 
-Registered AppHub components:
+**Registered AppHub components:**
 
-| Component | AppHub Kind | Trace attribute |
+| Component ID | AppHub Kind | Maps to |
 |---|---|---|
-| `web-forwarding-rule` | Service | GCP Forwarding Rule |
-| `web-lb-service` | Service | K8s LoadBalancer Service |
-| `web` | Workload | `service.name=web` |
-| `user-location` | Service | `service.name=user-location` |
-| `apphub-redis` | Service | `peer.service=apphub-redis` |
-| `apphub-alloydb` | Service | `peer.service=apphub-alloydb` |
+| `web` | Workload | GKE Deployment `web` in namespace `default` |
+| `web-lb-service` | Service | K8s ClusterIP Service `web` (Gateway API L7 LB) |
+| `user-location` | Service | Cloud Run service `user-location` |
+| `apphub-redis` | Service | Memorystore Redis instance |
+| `apphub-alloydb` | Service | AlloyDB instance |
 
 > Allow 5–10 minutes after generating traffic for the topology viewer to reflect new trace data.
 
@@ -346,9 +389,62 @@ Registered AppHub components:
 
 ## IAM Summary
 
-| Service Account | Roles |
-|---|---|
-| `apphub-gke-sa` | `logging.logWriter`, `monitoring.metricWriter`, `cloudtrace.agent`, `artifactregistry.reader`, `run.invoker` |
-| `apphub-cloudrun-sa` | `alloydb.client`, `alloydb.databaseUser`, `cloudtrace.agent`, `logging.logWriter` |
+| Service Account | Bound to | Roles |
+|---|---|---|
+| `apphub-gke-sa` | GKE node pool + K8s SA `web-sa` (Workload Identity) | `logging.logWriter`, `monitoring.metricWriter`, `cloudtrace.agent`, `artifactregistry.reader`, `run.invoker` |
+| `apphub-cloudrun-sa` | Cloud Run `user-location` | `alloydb.client`, `alloydb.databaseUser`, `cloudtrace.agent`, `logging.logWriter`, `secretmanager.secretAccessor` |
 
-GKE pods authenticate to GCP APIs via **Workload Identity**: the Kubernetes service account `web-sa` is bound to `apphub-gke-sa`, allowing pods to obtain OIDC tokens to call Cloud Run without storing any key files.
+GKE pods authenticate to Cloud Run via **Workload Identity**: the K8s service account `web-sa` is bound to `apphub-gke-sa`, enabling pods to mint OIDC tokens for Cloud Run invocation without storing any key files.
+
+---
+
+## Troubleshooting
+
+### Gateway returns `no healthy upstream`
+
+The GCP L7 backend may not be ready yet, or the health check path is wrong.
+
+```bash
+# Check backend health
+gcloud compute backend-services get-health \
+  $(gcloud compute backend-services list --global --project=${PROJECT_ID} \
+    --filter="name~gkegw.*default-web" --format="value(name)") \
+  --global --project=${PROJECT_ID}
+
+# Check HealthCheckPolicy is applied
+kubectl get healthcheckpolicy web -n default
+
+# Check Gateway status
+kubectl describe gateway web -n default
+```
+
+Wait 2–5 minutes after first deploying the Gateway for GCP to fully program the load balancer.
+
+### Pods in CrashLoopBackOff
+
+```bash
+kubectl logs -n default -l app=web --tail=50
+```
+
+Common causes:
+- Missing OTel package — check `web/requirements.txt` matches the import in `web/app.py`
+- Missing `USER_SERVICE_URL` env var — verify `k8s/deployment.yaml`
+
+### Traces not appearing in Cloud Trace
+
+```bash
+# Verify the managed collector is running
+kubectl get pods -n gke-managed-otel
+
+# Check OTLP endpoint in the deployment
+kubectl get deployment web -o jsonpath='{.spec.template.spec.containers[0].env}' | jq .
+
+# Expected: OTEL_EXPORTER_OTLP_ENDPOINT = http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+```
+
+### AlloyDB connection refused
+
+AlloyDB is private-IP only. Ensure:
+- Cloud Run has VPC egress via `apphub-connector`
+- `ALLOYDB_HOST` env var is the correct private IP
+- `DB_PASSWORD` secret version is current in Secret Manager

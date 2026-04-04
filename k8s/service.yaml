@@ -5,8 +5,10 @@ metadata:
   namespace: default
   labels:
     app: web
+  annotations:
+    cloud.google.com/neg: '{"ingress": true, "exposed_ports": {"80": {"name": "web-neg"}}}'
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: web
   ports:
@@ -14,3 +16,65 @@ spec:
       port: 80
       targetPort: 8080
       protocol: TCP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web
+  namespace: default
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: web
+  namespace: default
+spec:
+  default:
+    checkIntervalSec: 15
+    timeoutSec: 15
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+    logConfig:
+      enabled: false
+    config:
+      type: HTTP
+      httpHealthCheck:
+        requestPath: /healthz
+        port: 8080
+  targetRef:
+    group: ""
+    kind: Service
+    name: web
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: default
+spec:
+  parentRefs:
+    - name: web
+  rules:
+    # Only /user and /healthz are valid paths; all other requests get a 404
+    # from the Global External ALB without hitting the backend pods.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /user
+      backendRefs:
+        - name: web
+          port: 80
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /healthz
+      backendRefs:
+        - name: web
+          port: 80

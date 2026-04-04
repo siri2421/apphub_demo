@@ -28,6 +28,11 @@ resource "google_container_cluster" "apphub_cluster" {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
+  # Enable GKE Gateway API for L7 HTTP(S) load balancing
+  gateway_api_config {
+    channel = "CHANNEL_STANDARD"
+  }
+
   depends_on = [google_project_service.apis]
 }
 
