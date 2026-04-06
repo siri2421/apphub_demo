@@ -22,6 +22,14 @@ resource "google_project_iam_member" "gke_trace" {
   member  = "serviceAccount:${google_service_account.gke_sa.email}"
 }
 
+# GKE managed OTel collector exports to telemetry.googleapis.com which requires
+# telemetry.traces.write — not included in roles/cloudtrace.agent.
+resource "google_project_iam_member" "gke_telemetry_writer" {
+  project = var.project_id
+  role    = "roles/telemetry.writer"
+  member  = "serviceAccount:${google_service_account.gke_sa.email}"
+}
+
 # Allow GKE nodes to pull images from Artifact Registry
 resource "google_project_iam_member" "gke_ar_reader" {
   project = var.project_id

@@ -11,7 +11,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
-from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
 # Force W3C Trace Context (traceparent header) for cross-service trace propagation
@@ -50,17 +49,8 @@ provider = TracerProvider(resource=resource)
 # synchronously (no buffering). This ensures spans are delivered before Cloud
 # Run scales the instance to zero; the sidecar then batches and forwards to
 # Cloud Trace using the service account credentials (no manual auth needed here).
-provider.add_span_processor(
-    SimpleSpanProcessor(OTLPSpanExporter(
-        endpoint="localhost:4317",
-        insecure=True,
-    ))
-)
+provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint="localhost:4317", insecure=True)))
 trace.set_tracer_provider(provider)
-
-# RedisInstrumentor removed — the manual redis.get span already carries
-# peer.service=apphub-redis and db.system=redis for AppHub topology.
-# Auto-instrumentation added a redundant GET span alongside it.
 
 app = Flask(__name__)
 FlaskInstrumentor().instrument_app(app)
@@ -99,8 +89,8 @@ def get_user():
         return jsonify({"error": "user_id query parameter is required"}), 400
 
     # ── 1. Check Redis cache ─────────────────────────────────────────────────
-    # peer.service + db.system let the AppHub topology viewer draw an edge to
-    # the Redis node and identify it as a cache dependency.
+    # Client span from user-location (service.name="user-location") with
+    # peer.service="apphub-redis" creates the topology edge in AppHub.
     with tracer.start_as_current_span("redis.get", attributes={
         "peer.service": "apphub-redis",
         "db.system": "redis",
@@ -112,8 +102,8 @@ def get_user():
         return jsonify({"result": cached, "source": "cache"}), 200
 
     # ── 2. Fall back to AlloyDB ──────────────────────────────────────────────
-    # peer.service + db.* let the topology viewer draw an edge to the AlloyDB
-    # node and identify it as a PostgreSQL-compatible database dependency.
+    # Client span from user-location with peer.service="apphub-alloydb" creates
+    # the topology edge in AppHub.
     with tracer.start_as_current_span("alloydb.query", attributes={
         "peer.service": "apphub-alloydb",
         "db.system": "postgresql",

@@ -34,6 +34,10 @@ resource "kubernetes_deployment_v1" "web" {
             value = var.project_id
           }
           env {
+            name  = "GOOGLE_CLOUD_REGION"
+            value = var.region
+          }
+          env {
             name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
             value = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
           }
@@ -69,10 +73,6 @@ resource "kubernetes_service_v1" "web_lb" {
   metadata {
     name      = "web"
     namespace = "default"
-    annotations = {
-      # Named NEG "web-neg" matches the AppHub service_uri registered in apphub.tf
-      "cloud.google.com/neg" = jsonencode({ ingress = true, exposed_ports = { "80" = { name = "web-neg" } } })
-    }
   }
   spec {
     selector = { app = "web" }
@@ -80,7 +80,7 @@ resource "kubernetes_service_v1" "web_lb" {
       port        = 80
       target_port = 8080
     }
-    type = "ClusterIP"
+    type = "LoadBalancer"
   }
 }
 

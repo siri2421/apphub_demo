@@ -26,6 +26,8 @@ spec:
               value: "https://user-location-iupz3py3ha-uc.a.run.app"
             - name: GOOGLE_CLOUD_PROJECT
               value: "agentic-marketing-demo"
+            - name: GOOGLE_CLOUD_REGION
+              value: "us-central1"
             # Route OTLP telemetry to the GKE managed collector (ClusterIP service).
             # The collector handles GCP auth and exports to Cloud Trace / Cloud Monitoring.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
