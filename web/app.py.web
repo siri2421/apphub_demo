@@ -2,7 +2,6 @@ import os
 import google.auth.transport.requests
 import google.oauth2.id_token
 import requests as http_client
-import redis
 from flask import Flask, request, Response, abort
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
@@ -17,7 +16,6 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
-from opentelemetry.trace import SpanKind, StatusCode
 
 # Trace Context Propagation
 set_global_textmap(CompositePropagator([
@@ -48,11 +46,11 @@ app = Flask(__name__)
 FlaskInstrumentor().instrument_app(app)
 tracer = trace.get_tracer(__name__)
 
-USER_SERVICE_URL = "https://user-location-iupz3py3ha-uc.a.run.app"#os.environ["USER_SERVICE_URL"].rstrip("/")
+USER_SERVICE_URL = os.environ["USER_SERVICE_URL"].rstrip("/")
 _auth_req = google.auth.transport.requests.Request()
 
-@app.route("/usercr")
-def usercr():
+@app.route("/user")
+def user():
     user_id = request.args.get("user_id")
     if not user_id: return {"error": "user_id required"}, 400
 
@@ -69,38 +67,6 @@ def usercr():
     
     return Response(resp.content, status=resp.status_code, content_type="application/json")
 
-
-# ── Redis Config ──
-# You will need to add REDIS_HOST to your GKE Deployment env vars
-REDIS_HOST = os.environ.get("REDIS_HOST", "10.105.161.131") 
-REDIS_URI = f"//redis.googleapis.com/projects/{_project_id}/locations/{_region}/instances/apphub-redis"
-redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-
-@app.route("/userdirect")
-def userdirect():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return {"error": "user_id required"}, 400
-
-    # Direct Redis call from GKE
-    with tracer.start_as_current_span(
-        "web.redis_check",
-        kind=SpanKind.CLIENT,
-        attributes={
-            "gcp.resource.name": REDIS_URI,
-            "db.system": "redis"
-        }
-    ) as span:
-        try:
-            cached_val = redis_client.get(user_id)
-            if cached_val:
-                return {"result": cached_val, "source": "gke-direct-cache"}
-        except Exception as e:
-            span.set_status(StatusCode.ERROR, str(e))
-            # Fallback to existing Cloud Run logic if Redis fails or misses
-    
-    # Fallback logic (your original Cloud Run call)
-    return {"status": "miss", "detail": "Proceeding to downstream..."}, 200
 @app.route("/healthz")
 def healthz(): return {"status": "ok"}, 200
 

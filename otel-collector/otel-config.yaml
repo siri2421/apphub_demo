@@ -7,23 +7,50 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
-  # resourcedetection auto-populates Cloud Run metadata (project, region, revision,
-  # instance ID) so the googlecloud exporter can route to the right project without
-  # any hard-coded project ID.
-  resourcedetection:
-    detectors: [gcp]
   batch:
+    send_batch_max_size: 500
+    send_batch_size: 500
+    timeout: 1s
+  resource:
+    attributes:
+      - { key: "location", value: "us-central1", action: "upsert" }
+      - { key: "cluster", value: "no-cluster", action: "upsert" }
+      - { key: "namespace", value: "no-namespace", action: "upsert" }
+      - { key: "job", value: "us-job", action: "upsert" }
+      - { key: "instance", value: "us-instance", action: "upsert" }
+  # If running on GCP (e.g. on GKE), detect resource attributes from the environment. 
+  # Detects project, region, instance, etc. automatically from GCP metadata
+  resourcedetection:
+    detectors: ["env", "gcp"]
+    timeout: 2s
+
+  # Only needed if resourcedetection fails to pick up the project ID
+  resource/project_id:
+    attributes:
+    - key: gcp.project_id
+      value: ${GOOGLE_CLOUD_PROJECT}
+      action: insert
 
 exporters:
   googlecloud:
-    # Project is resolved automatically via the resourcedetection processor above.
-    # The Cloud Run service account (apphub-cloudrun-sa) provides auth via ADC.
+    project: ${GOOGLE_CLOUD_PROJECT}
+    trace:
+      endpoint: telemetry.googleapis.com:443
+  otlphttp:
+    encoding: proto
+    # Full path is recommended for the telemetry API
+    endpoint: "https://telemetry.googleapis.com/v1/traces"
+    auth:
+      authenticator: googleclientauth
+
+extensions:
+  googleclientauth: {}
 
 service:
+  extensions: [googleclientauth]
   pipelines:
     traces:
       receivers: [otlp]
-      # resourcedetection must run before batch so resource attributes are attached
-      # to spans before they are grouped and sent to Cloud Trace.
-      processors: [resourcedetection, batch]
+      # Order matters: detect first, then modify, then batch
+      processors: [resourcedetection, resource/project_id, batch]
       exporters: [googlecloud]

@@ -1,0 +1,85 @@
+import os
+import requests as http_client
+from flask import Flask, request, Response
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
+
+# 1. Trace Context Propagation Setup
+set_global_textmap(CompositePropagator([
+    TraceContextTextMapPropagator(),
+    CloudTraceFormatPropagator(),
+]))
+
+_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "agentic-marketing-demo")
+
+# 2. Resource Setup with App Hub Identifiers
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+    Resource.create({
+        "service.name": "web-frontend", # Identifies this Cloud Run service
+        "service.namespace": "default",
+        #"gcp.apphub.application.id": "apphub-demo",
+        #"gcp.apphub.service.id": "web-frontend", 
+    })
+)
+
+provider = TracerProvider(resource=resource)
+# Cloud Run sidecar usually listens on localhost:4318 for HTTP OTLP
+_otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces")
+provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint=_otlp_endpoint)))
+trace.set_tracer_provider(provider)
+
+# Auto-instrument requests to propagate headers automatically
+RequestsInstrumentor().instrument(excluded_urls="metadata.google.internal,169.254.169.254")
+
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+tracer = trace.get_tracer(__name__)
+
+# --- GKE CONFIG ---
+# Replace this with your GKE Service IP or Internal Load Balancer IP
+GKE_BACKEND_URL = os.environ.get("GKE_BACKEND_URL", "http://34.59.68.97")
+
+@app.route("/user")
+def user():
+    user_id = request.args.get("user_id")
+    if not user_id: 
+        return {"error": "user_id required"}, 400
+
+    # This URI represents the GKE Service in App Hub to draw the edge
+    # Replace {CLUSTER_NAME} with your actual GKE cluster name
+    gke_resource_uri = f"//container.googleapis.com/projects/{_project_id}/locations/us-central1/clusters/apphub-cluster"
+
+    with tracer.start_as_current_span(
+        "call-gke-backend",
+        kind=SpanKind.CLIENT,
+        attributes={"gcp.resource.name": gke_resource_uri}
+    ):
+        # We no longer need OIDC tokens for a standard GKE service IP
+        # The 'requests' instrumentor handles passing the trace headers
+        try:
+            resp = http_client.get(
+                f"{GKE_BACKEND_URL}/internal-user", 
+                params={"user_id": user_id},
+                timeout=5
+            )
+            return Response(resp.content, status=resp.status_code, content_type="application/json")
+        except Exception as e:
+            return {"error": "failed to reach gke backend", "details": str(e)}, 500
+
+@app.route("/healthz")
+def healthz(): 
+    return {"status": "ok"}, 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

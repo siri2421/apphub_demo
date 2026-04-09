@@ -1,11 +1,12 @@
 import os
+import redis # Ensure 'redis' is in your requirements.txt
 import google.auth.transport.requests
 import google.oauth2.id_token
 import requests as http_client
-import redis
 from flask import Flask, request, Response, abort
+
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.propagate import set_global_textmap
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
@@ -17,9 +18,8 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
-from opentelemetry.trace import SpanKind, StatusCode
 
-# Trace Context Propagation
+# ── OTel Setup ──────────────────────────────────────────────────────────────
 set_global_textmap(CompositePropagator([
     TraceContextTextMapPropagator(),
     CloudTraceFormatPropagator(),
@@ -32,8 +32,8 @@ resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
     Resource.create({
         "service.name": "web",
         "service.namespace": "default",
-       # "gcp.apphub.application.id": "apphub-demo",
-        #"gcp.apphub.workload.id": "web",
+        "gcp.apphub.application.id": "apphub-demo",
+        "gcp.apphub.workload.id": "web",
     })
 )
 
@@ -43,32 +43,9 @@ if _otlp_endpoint:
     provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
 trace.set_tracer_provider(provider)
 
-RequestsInstrumentor().instrument(excluded_urls="metadata.google.internal,169.254.169.254,oauth2.googleapis.com")
 app = Flask(__name__)
 FlaskInstrumentor().instrument_app(app)
 tracer = trace.get_tracer(__name__)
-
-USER_SERVICE_URL = "https://user-location-iupz3py3ha-uc.a.run.app"#os.environ["USER_SERVICE_URL"].rstrip("/")
-_auth_req = google.auth.transport.requests.Request()
-
-@app.route("/usercr")
-def usercr():
-    user_id = request.args.get("user_id")
-    if not user_id: return {"error": "user_id required"}, 400
-
-    # Resource URI for the target Cloud Run service
-    target_uri = f"//run.googleapis.com/projects/{_project_id}/locations/{_region}/services/user-location"
-    
-    with tracer.start_as_current_span(
-        "user-location.get_user",
-        kind=SpanKind.CLIENT,
-        attributes={"gcp.resource.name": target_uri}
-    ):
-        token = google.oauth2.id_token.fetch_id_token(_auth_req, USER_SERVICE_URL)
-        resp = http_client.get(f"{USER_SERVICE_URL}/user", params={"user_id": user_id}, headers={"Authorization": f"Bearer {token}"})
-    
-    return Response(resp.content, status=resp.status_code, content_type="application/json")
-
 
 # ── Redis Config ──
 # You will need to add REDIS_HOST to your GKE Deployment env vars
@@ -76,8 +53,8 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "10.105.161.131")
 REDIS_URI = f"//redis.googleapis.com/projects/{_project_id}/locations/{_region}/instances/apphub-redis"
 redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 
-@app.route("/userdirect")
-def userdirect():
+@app.route("/user")
+def user():
     user_id = request.args.get("user_id")
     if not user_id:
         return {"error": "user_id required"}, 400
@@ -101,8 +78,10 @@ def userdirect():
     
     # Fallback logic (your original Cloud Run call)
     return {"status": "miss", "detail": "Proceeding to downstream..."}, 200
+
 @app.route("/healthz")
-def healthz(): return {"status": "ok"}, 200
+def healthz():
+    return {"status": "ok"}, 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

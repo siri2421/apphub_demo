@@ -1,0 +1,118 @@
+import os
+import redis
+import pg8000.dbapi
+import atexit # Added for clean shutdown
+from flask import Flask, request, jsonify
+
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.propagate import set_global_textmap, extract
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
+
+# 1. Setup Context Propagation
+#set_global_textmap(TraceContextTextMapPropagator())
+set_global_textmap(CompositePropagator([
+    TraceContextTextMapPropagator(),
+    CloudTraceFormatPropagator(),
+]))
+
+_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "agentic-marketing-demo")
+
+# 2. Setup Resource and Provider
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+    Resource.create({
+        "service.name": "user-location",
+        "service.namespace": "default"
+        #"gcp.apphub.application.id": "apphub-demo",
+        #"gcp.apphub.service.id": "user-location",
+    })
+)
+
+provider = TracerProvider(resource=resource)
+# SimpleSpanProcessor sends immediately; local collector sidecar batches to Cloud Trace
+processor = SimpleSpanProcessor(OTLPSpanExporter(endpoint="localhost:4317", insecure=True))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+# 3. Handle Shutdown (Crucial for Cloud Run to flush final spans)
+atexit.register(provider.shutdown)
+
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+tracer = trace.get_tracer(__name__)
+
+# Config
+redis_client = redis.Redis(
+    host=os.environ["REDIS_HOST"], 
+    port=int(os.environ.get("REDIS_PORT", 6379)), 
+    decode_responses=True
+)
+
+ALLOYDB_URI = f"//alloydb.googleapis.com/projects/{_project_id}/locations/us-central1/clusters/apphub-alloydb/instances/apphub-primary"
+REDIS_URI = f"//redis.googleapis.com/projects/{_project_id}/locations/us-central1/instances/apphub-redis"
+
+@app.route("/user")
+def get_user():
+    # Explicitly extract the context from headers sent by the 'web' service
+    context = extract(request.headers)
+    
+    # INDENTATION FIXED: The database spans are now inside the /user_handler block
+    with tracer.start_as_current_span("/user_handler", context=context):
+        user_id = request.args.get("user_id")
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
+    
+        # ── 1. Redis Cache Check ─────────────────────────────────────────────
+        with tracer.start_as_current_span(
+            "redis.get", 
+            kind=SpanKind.CLIENT, 
+            attributes={"gcp.resource.name": REDIS_URI, "db.system": "redis"}
+        ) as span:
+            try:
+                cached = redis_client.get(user_id)
+                if cached: 
+                    return jsonify({"result": cached, "source": "cache"})
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+
+        # ── 2. AlloyDB Fallback ──────────────────────────────────────────────
+        with tracer.start_as_current_span(
+            "alloydb.query", 
+            kind=SpanKind.CLIENT, 
+            attributes={"gcp.resource.name": ALLOYDB_URI, "db.system": "postgresql"}
+        ) as span:
+            try:
+                conn = pg8000.dbapi.connect(
+                    host=os.environ["ALLOYDB_HOST"], 
+                    user="postgres", 
+                    password=os.environ["DB_PASSWORD"], 
+                    database="postgres", 
+                    ssl_context=True
+                )
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_name FROM users WHERE user_id = %s", (user_id,))
+                row = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                
+                if row:
+                    # Write back to Redis
+                    redis_client.set(user_id, row[0])
+                    return jsonify({"result": row[0], "source": "database"})
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+                return jsonify({"error": str(e)}), 500
+
+        provider.force_flush()
+        return jsonify({"error": "not found"}), 404
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

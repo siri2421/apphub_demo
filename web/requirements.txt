@@ -4,7 +4,8 @@ gunicorn==22.0.0
 requests==2.32.3
 google-auth==2.29.0
 google-auth-httplib2==0.2.0
-
+redis==5.0.4
+pg8000==1.31.2
 # OpenTelemetry — exports via HTTP to the local managed OTel Collector DaemonSet
 opentelemetry-sdk==1.24.0
 opentelemetry-exporter-otlp-proto-http==1.24.0
@@ -12,3 +13,5 @@ opentelemetry-resourcedetector-gcp==1.5.0a0
 opentelemetry-propagator-gcp==1.5.0
 opentelemetry-instrumentation-flask==0.45b0
 opentelemetry-instrumentation-requests==0.45b0
+opentelemetry-exporter-otlp-proto-grpc==1.24.0
+opentelemetry-instrumentation-redis==0.45b0

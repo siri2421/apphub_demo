@@ -1,142 +1,83 @@
 import os
 import redis
-import pg8000.dbapi
+import atexit
 from flask import Flask, request, jsonify
 
+# 1. Module-level patching (Must happen first)
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+
+# Patch redis early so the client is wrapped upon creation
+RedisInstrumentor().instrument()
+
 from opentelemetry import trace
-from opentelemetry.propagate import set_global_textmap
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
 
-# Force W3C Trace Context (traceparent header) for cross-service trace propagation
-set_global_textmap(TraceContextTextMapPropagator())
-
-# ── OTel setup ──────────────────────────────────────────────────────────────
-# Use the GCP-detected resource as the base so cloud.platform, cloud.region,
-# faas.name etc. for Cloud Run are populated for AppHub topology.
-# Merge service-specific attributes on top; they take priority.
-_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-detected_resource = GoogleCloudResourceDetector(raise_on_error=False).detect()
-resource = detected_resource.merge(
+# 2. GLOBAL INITIALIZATION (Outside the route)
+# This detects GCP metadata once when the worker process starts
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
     Resource.create({
         "service.name": "user-location",
-        "service.namespace": "default",
-        "gcp.project_id": _project_id,
-        "gcp.resource_type": "cloud_run_revision",
-        "cloud.platform": "gcp_cloud_run",
-        # AppHub identity labels — Cloud Run's metadata server does not expose
-        # AppHub context the way GKE does, so we set these explicitly.
-        # They must match the application_id and service_id registered in apphub.tf
-        # so that AppHub can ground these spans to the registered service and
-        # draw topology edges via the peer.service attributes on redis.get /
-        # alloydb.query spans.
-        "gcp.apphub.application.container": f"projects/{_project_id}",
-        "gcp.apphub.application.location": "us-central1",
         "gcp.apphub.application.id": "apphub-demo",
         "gcp.apphub.service.id": "user-location",
-        "gcp.apphub.service.criticality_type": "MISSION_CRITICAL",
-        "gcp.apphub.service.environment_type": "PRODUCTION",
     })
 )
 
 provider = TracerProvider(resource=resource)
-# SimpleSpanProcessor sends each span to the local OTel Collector sidecar
-# synchronously (no buffering). This ensures spans are delivered before Cloud
-# Run scales the instance to zero; the sidecar then batches and forwards to
-# Cloud Trace using the service account credentials (no manual auth needed here).
-provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint="localhost:4317", insecure=True)))
+# SimpleSpanProcessor sends spans immediately to the sidecar
+exporter = OTLPSpanExporter(endpoint="localhost:4317", insecure=True)
+provider.add_span_processor(SimpleSpanProcessor(exporter))
 trace.set_tracer_provider(provider)
 
 app = Flask(__name__)
-FlaskInstrumentor().instrument_app(app)
 
+# CRITICAL: instrument_app MUST be called here, in the global scope, 
+# BEFORE the first request is handled.
+FlaskInstrumentor().instrument_app(app)
 tracer = trace.get_tracer(__name__)
 
-# ── Redis client ─────────────────────────────────────────────────────────────
+# 3. Redis Config
 redis_client = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ.get("REDIS_PORT", 6379)),
-    decode_responses=True,
+    host=os.environ.get("REDIS_HOST", "10.105.161.131"), 
+    port=6379, 
+    decode_responses=True
 )
-
-# ── AlloyDB direct connection (private IP + SSL) ──────────────────────────────
-ALLOYDB_HOST = os.environ["ALLOYDB_HOST"]
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASSWORD = os.environ["DB_PASSWORD"]
-DB_NAME = os.environ.get("DB_NAME", "postgres")
-
-
-def _get_db_conn():
-    return pg8000.dbapi.connect(
-        host=ALLOYDB_HOST,
-        port=5432,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        ssl_context=True,
-    )
-
 
 @app.route("/user")
 def get_user():
     user_id = request.args.get("user_id")
     if not user_id:
-        return jsonify({"error": "user_id query parameter is required"}), 400
+        return jsonify({"error": "user_id required"}), 400
 
-    # ── 1. Check Redis cache ─────────────────────────────────────────────────
-    # Client span from user-location (service.name="user-location") with
-    # peer.service="apphub-redis" creates the topology edge in AppHub.
-    with tracer.start_as_current_span("redis.get", attributes={
-        "peer.service": "apphub-redis",
-        "db.system": "redis",
-        "net.peer.name": os.environ.get("REDIS_HOST", ""),
-    }):
-        cached = redis_client.get(user_id)
-
-    if cached:
-        return jsonify({"result": cached, "source": "cache"}), 200
-
-    # ── 2. Fall back to AlloyDB ──────────────────────────────────────────────
-    # Client span from user-location with peer.service="apphub-alloydb" creates
-    # the topology edge in AppHub.
-    with tracer.start_as_current_span("alloydb.query", attributes={
-        "peer.service": "apphub-alloydb",
-        "db.system": "postgresql",
-        "db.name": DB_NAME,
-        "db.user": DB_USER,
-        "net.peer.name": ALLOYDB_HOST,
-    }):
-        conn = _get_db_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_name FROM users WHERE user_id = %s", (user_id,)
-        )
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-    if row:
-        # Write back to Redis so subsequent lookups are served from cache.
-        with tracer.start_as_current_span("redis.set", attributes={
-            "peer.service": "apphub-redis",
+    # Nest the Redis span under the auto-generated Flask span
+    with tracer.start_as_current_span(
+        "redis.get", 
+        kind=SpanKind.CLIENT,
+        attributes={
+            "gcp.resource.name": f"//redis.googleapis.com/projects/{os.environ.get('GOOGLE_CLOUD_PROJECT')}/locations/us-central1/instances/apphub-redis",
             "db.system": "redis",
-            "net.peer.name": os.environ.get("REDIS_HOST", ""),
-        }):
-            redis_client.set(user_id, row[0])
-        return jsonify({"result": row[0], "source": "database"}), 200
-
-    return jsonify({"error": "user not found"}), 404
-
-
-@app.route("/healthz")
-def healthz():
-    return jsonify({"status": "ok"}), 200
-
+            "peer.service": "apphub-redis"
+        }
+    ) as span:
+        try:
+            cached = redis_client.get(user_id)
+            
+            # Flush manually to ensure the leaf span clears the process 
+            # before the HTTP response is sent.
+            provider.force_flush()
+            
+            if cached:
+                return jsonify({"result": cached, "source": "cache"})
+            return jsonify({"error": "not found"}), 404
+            
+        except Exception as e:
+            span.set_status(StatusCode.ERROR, str(e))
+            return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

@@ -1,0 +1,134 @@
+import os
+import redis
+import pg8000.dbapi
+import atexit
+from flask import Flask, request, jsonify
+
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.propagate import set_global_textmap, extract
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.resourcedetector.gcp_resource_detector import GoogleCloudResourceDetector
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
+
+# ── 1. OPENTELEMETRY & CONTEXT SETUP ────────────────────────────────────────
+# Use Composite to ensure we catch headers from Cloud Run or GFE
+set_global_textmap(CompositePropagator([
+    TraceContextTextMapPropagator(),
+    CloudTraceFormatPropagator(),
+]))
+
+_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "agentic-marketing-demo")
+
+# GKE Resource: App Hub needs these to 'ground' the GKE workload
+resource = GoogleCloudResourceDetector(raise_on_error=False).detect().merge(
+    Resource.create({
+        "service.name": "web-backend",
+        "service.namespace": "default",
+       # "gcp.apphub.application.id": "apphub-demo",
+       # "gcp.apphub.workload.id": "web", # Matches your App Hub Workload
+    })
+)
+
+provider = TracerProvider(resource=resource)
+# GKE pods usually talk to a collector service at a specific internal DNS
+#_collector_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+#"http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces
+#_otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+#if _otlp_endpoint:
+#    provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
+trace.set_tracer_provider(provider)
+#processor = SimpleSpanProcessor(OTLPSpanExporter(endpoint=_otlp_endpoint))
+##provider.add_span_processor(processor)
+#trace.set_tracer_provider(provider)
+
+atexit.register(provider.shutdown)
+
+# ── 2. INITIALIZATION ───────────────────────────────────────────────────────
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+tracer = trace.get_tracer(__name__)
+
+# Redis Client (Persistent Connection Pool in GKE)
+redis_client = redis.Redis(
+    host=os.environ.get("REDIS_HOST", "10.105.161.131"),
+    port=6379,
+    decode_responses=True,
+    socket_connect_timeout=2.0
+)
+
+# App Hub URIs for Topology Mapping
+REDIS_URI = f"//redis.googleapis.com/projects/{_project_id}/locations/us-central1/instances/apphub-redis"
+ALLOYDB_URI = f"//alloydb.googleapis.com/projects/{_project_id}/locations/us-central1/clusters/apphub-alloydb/instances/apphub-primary"
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+# ── 3. BACKEND LOGIC ────────────────────────────────────────────────────────
+@app.route("/internal-user")
+def handle_database_logic():
+    # Extract context passed from the Cloud Run 'Frontend'
+    context = extract(request.headers)
+    
+    response_data = None
+    status_code = 200
+
+    with tracer.start_as_current_span("gke.database_handler", context=context):
+        user_id = request.args.get("user_id")
+        if not user_id:
+            return jsonify({"error": "missing user_id"}), 400
+
+        # --- Sub-span: Redis Check ---
+        with tracer.start_as_current_span(
+            "redis.get", 
+            kind=SpanKind.CLIENT, 
+            attributes={"gcp.resource.name": REDIS_URI, "db.system": "redis"}
+        ) as span:
+            try:
+                cached = redis_client.get(user_id)
+                if cached:
+                    response_data = {"result": cached, "source": "gke-cache"}
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+
+        # --- Sub-span: AlloyDB Fallback ---
+        if not response_data:
+            with tracer.start_as_current_span(
+                "alloydb.query", 
+                kind=SpanKind.CLIENT, 
+                attributes={"gcp.resource.name": ALLOYDB_URI, "db.system": "postgresql"}
+            ) as span:
+                try:
+                    conn = pg8000.dbapi.connect(
+                        host=os.environ.get("ALLOYDB_HOST"),
+                        user="postgres",
+                        password=os.environ.get("DB_PASSWORD"),
+                        database="postgres",
+                        ssl_context=True
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT user_name FROM users WHERE user_id = %s", (user_id,))
+                    row = cursor.fetchone()
+                    cursor.close()
+                    conn.close()
+                    
+                    if row:
+                        redis_client.set(user_id, row[0])
+                        response_data = {"result": row[0], "source": "gke-database"}
+                    else:
+                        response_data, status_code = {"error": "not found"}, 404
+                except Exception as e:
+                    span.set_status(StatusCode.ERROR, str(e))
+                    response_data, status_code = {"error": "gke-db-fail", "detail": str(e)}, 500
+
+    return jsonify(response_data), status_code
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
